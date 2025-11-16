@@ -2,3 +2,4 @@ fastapi
 uvicorn
 pyserial
 requests
+python-multipart
