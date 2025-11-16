@@ -1,29 +1,37 @@
 # main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
-from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
 import serial
 import threading
 import time
 import re
 import base64
-import requests
+from typing import Optional
 
 app = FastAPI()
 
+# CORS 허용 (Vercel에서 호출하기 위해)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # 데모용: 모두 허용
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # -------------------------------
-# 전역 변수 (센서 최신 값 저장)
+# 전역 변수 (센서 최신 값 + 카메라 이미지)
 # -------------------------------
-latest_temp = None
-latest_hum = None
-latest_tilt = None
-latest_image_base64 = None
+latest_temp: Optional[float] = None
+latest_hum: Optional[float] = None
+latest_tilt: Optional[float] = None
+latest_image_bytes: Optional[bytes] = None
 
 
 # -------------------------------
 # 시리얼 센서 읽기 (백그라운드 스레드)
 # -------------------------------
-def extract(pattern, text):
+def extract(pattern, text: str):
     m = re.search(pattern, text)
     return float(m.group(1)) if m else None
 
@@ -62,23 +70,6 @@ def serial_reader():
 
 
 # -------------------------------
-# 카메라 이미지 가져오기 (백그라운드 스레드)
-# -------------------------------
-def camera_reader():
-    global latest_image_base64
-    ESP32_URL = "http://172.20.10.4/capture"
-
-    while True:
-        try:
-            img = requests.get(ESP32_URL, timeout=1).content
-            latest_image_base64 = base64.b64encode(img).decode()
-        except:
-            pass
-
-        time.sleep(0.2)
-
-
-# -------------------------------
 # API 라우트
 # -------------------------------
 @app.get("/")
@@ -95,18 +86,26 @@ def get_sensor():
     })
 
 
+# ✅ ESP32가 이미지를 업로드하는 엔드포인트
+@app.post("/upload_camera")
+async def upload_camera(file: UploadFile = File(...)):
+    global latest_image_bytes
+    latest_image_bytes = await file.read()
+    print(f"Uploaded image: {len(latest_image_bytes)} bytes")
+    return {"status": "ok"}
+
+
+# ✅ 프론트(Vercel)가 이미지를 가져가는 엔드포인트
 @app.get("/camera")
 def get_camera():
-    if latest_image_base64 is None:
+    if latest_image_bytes is None:
         return JSONResponse({"error": "no image"}, status_code=404)
 
-    return JSONResponse({
-        "image": latest_image_base64
-    })
+    image_b64 = base64.b64encode(latest_image_bytes).decode()
+    return {"image": image_b64}
 
 
 # -------------------------------
 # 백그라운드 스레드 실행
 # -------------------------------
 threading.Thread(target=serial_reader, daemon=True).start()
-threading.Thread(target=camera_reader, daemon=True).start()
