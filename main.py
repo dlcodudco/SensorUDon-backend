@@ -1,7 +1,9 @@
 # main.py
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
 import serial
 import threading
 import time
@@ -9,65 +11,61 @@ import json
 import re
 import os
 from datetime import datetime
+from typing import Optional
 
 app = FastAPI()
 
-# -------------------------------
-# CORS 설정 (앱/웹에서 호출 가능하게)
-# -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 데모용: 모두 허용 (나중에 도메인 제한 가능)
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------------
-# 전역 변수: 센서 최신 값
-# -------------------------------
-latest_temp: float | None = None   # ℃
-latest_hum: float | None = None    # %RH
-latest_tilt: float | None = None   # deg
+latest_temp: Optional[float] = None
+latest_hum: Optional[float] = None
+latest_tilt: Optional[float] = None
 
-# LoRa 수신기 포트 (나중에 실제 포트 번호로 바꾸면 됨)
-SERIAL_PORT = "COM14"
-BAUD_RATE = 115200
+# ====== 최신 카메라 프레임(메모리) ======
+latest_jpg: Optional[bytes] = None
+latest_jpg_ts: Optional[str] = None
+latest_jpg_name: Optional[str] = None
 
-# 카메라 이미지 저장 폴더
-CAMERA_DIR = "camera_images"
+SERIAL_PORT = os.getenv("SERIAL_PORT", "COM14")
+BAUD_RATE = int(os.getenv("BAUD_RATE", "115200"))
+USE_SERIAL = os.getenv("USE_SERIAL", "0") == "1"
+
+CAMERA_DIR = os.getenv("CAMERA_DIR", "camera_images")
+os.makedirs(CAMERA_DIR, exist_ok=True)
+
+app.mount("/camera_images", StaticFiles(directory=CAMERA_DIR), name="camera_images")
 
 
-# -------------------------------
-# 보조 함수: 텍스트에서 숫자 뽑기 (백업용)
-# -------------------------------
 def extract(pattern: str, text: str):
-    """
-    pattern 에서 캡처 그룹 1개로 숫자를 뽑아 float로 변환
-    """
     m = re.search(pattern, text)
     return float(m.group(1)) if m else None
 
 
-# -------------------------------
-# 시리얼 리더 스레드
-# -------------------------------
 def serial_reader():
     global latest_temp, latest_hum, latest_tilt
 
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        print(f"[SERIAL] Connected on {SERIAL_PORT}")
-    except Exception as e:
-        print("[SERIAL] Open failed:", e)
-        print("[SERIAL] → 실제 하드웨어 대신 dummy 값으로 동작합니다.")
-        ser = None
+    ser = None
+    if USE_SERIAL:
+        try:
+            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+            print(f"[SERIAL] Connected on {SERIAL_PORT} @ {BAUD_RATE}")
+        except Exception as e:
+            print("[SERIAL] Open failed:", e)
+            print("[SERIAL] → dummy 값으로 동작합니다.")
+            ser = None
+    else:
+        print("[SERIAL] USE_SERIAL=0 → dummy 값으로 동작합니다.")
 
     while True:
         try:
             if ser:
                 line = ser.readline().decode(errors="ignore").strip()
             else:
-                # 하드웨어 없을 때 테스트용
                 line = '{"tilt": 3.2, "temp": 25.4, "humid": 41.2}'
                 time.sleep(1)
 
@@ -76,24 +74,19 @@ def serial_reader():
 
             print("[SERIAL LINE]", line)
 
-            # 1) 아두이노가 출력하는 JSON ({...}) 라인 우선 처리
             if line.startswith("{") and line.endswith("}"):
                 try:
                     data = json.loads(line)
-
-                    # 아두이노 JSON 키: tilt, temp, humid
-                    if "temp" in data:
+                    if "temp" in data and data["temp"] is not None:
                         latest_temp = float(data["temp"])
-                    if "humid" in data:
+                    if "humid" in data and data["humid"] is not None:
                         latest_hum = float(data["humid"])
-                    if "tilt" in data:
+                    if "tilt" in data and data["tilt"] is not None:
                         latest_tilt = float(data["tilt"])
-
-                    continue  # 이 줄은 여기서 끝
+                    continue
                 except Exception as e:
                     print("[JSON ERROR]", e)
 
-            # 2) JSON이 아닌 경우(디버그 텍스트 등) 대비: 정규식으로 숫자 뽑기
             t = extract(r"(?:temp|temperature)[:=\s]+([-+]?\d+\.?\d*)", line)
             h = extract(r"(?:hum|humid|humidity)[:=\s]+([-+]?\d+\.?\d*)", line)
             tilt = extract(r"(?:tilt|roll|angle)[:=\s]+([-+]?\d+\.?\d*)", line)
@@ -110,17 +103,16 @@ def serial_reader():
             time.sleep(0.1)
 
 
-# 서버 시작 시 시리얼 리더 스레드 실행
 threading.Thread(target=serial_reader, daemon=True).start()
 
 
-# -------------------------------
-# API 라우트
-# -------------------------------
 @app.get("/")
 def root():
     return {
-        "status": "SensorUDon backend running (LoRa RX / COM14)",
+        "status": "SensorUDon backend running",
+        "camera_gallery": "/camera",
+        "camera_live": "/camera/live",
+        "camera_latest": "/camera/latest.jpg",
         "camera_upload": "/upload_camera",
         "sensor_endpoint": "/sensor",
     }
@@ -128,48 +120,123 @@ def root():
 
 @app.get("/sensor")
 def get_sensor():
-    """
-    프론트/앱에서 주기적으로 호출하면 되는 엔드포인트.
-    반환 형식:
-    {
-      "temperature": float | null,
-      "humidity": float | null,
-      "tilt": float | null
-    }
-    """
     return JSONResponse(
-        {
-            "temperature": latest_temp,
-            "humidity": latest_hum,
-            "tilt": latest_tilt,
-        }
+        {"temperature": latest_temp, "humidity": latest_hum, "tilt": latest_tilt}
     )
 
 
-# -------------------------------
-# 카메라 업로드 엔드포인트
-# ESP32가 JPEG 바디를 그대로 POST
-# -------------------------------
+# ====== 카메라 갤러리(저장된 파일들) ======
+@app.get("/camera", response_class=HTMLResponse)
+def camera_page():
+    files = sorted(
+        [f for f in os.listdir(CAMERA_DIR) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
+        reverse=True
+    )[:50]
+
+    items = "\n".join(
+        [
+            f"""
+            <div style="margin:12px 0;">
+              <div style="font-size:12px;color:#444;margin-bottom:6px;">{f}</div>
+              <img src="/camera_images/{f}" style="max-width:720px;width:100%;border:1px solid #ddd;border-radius:10px;">
+            </div>
+            """
+            for f in files
+        ]
+    ) or "<p>No images yet.</p>"
+
+    return f"""
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>SensorUDon Camera</title>
+      </head>
+      <body style="font-family:Arial, sans-serif; padding:16px; max-width:900px; margin:0 auto;">
+        <h2>📷 Camera uploads</h2>
+        <p>
+          Upload endpoint: <code>/upload_camera</code><br/>
+          Live page: <a href="/camera/live">/camera/live</a><br/>
+          Latest frame: <a href="/camera/latest.jpg">/camera/latest.jpg</a>
+        </p>
+        <hr/>
+        {items}
+      </body>
+    </html>
+    """
+
+
+def _latest_file_path() -> Optional[str]:
+    try:
+        files = sorted(
+            [f for f in os.listdir(CAMERA_DIR) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
+            reverse=True
+        )
+        if not files:
+            return None
+        return os.path.join(CAMERA_DIR, files[0])
+    except Exception:
+        return None
+
+
+# ====== 최신 프레임(1장)만 바로 제공 ======
+@app.get("/camera/latest.jpg")
+def camera_latest():
+    if latest_jpg:
+        return Response(latest_jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    # 서버 재시작 등으로 메모리가 비었으면 파일에서 fallback
+    path = _latest_file_path()
+    if not path:
+        raise HTTPException(404, "아직 업로드된 이미지가 없습니다.")
+    with open(path, "rb") as f:
+        data = f.read()
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+# ====== 라이브 페이지(최신 1장을 주기적으로 새로고침) ======
+@app.get("/camera/live", response_class=HTMLResponse)
+def camera_live():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Camera</title>
+  <style>
+    body{font-family:Arial, sans-serif; padding:16px; max-width:900px; margin:0 auto;}
+    img{max-width:100%; border:1px solid #ddd; border-radius:12px;}
+    .meta{font-size:12px; color:#555; margin:8px 0 12px;}
+    code{background:#f3f3f3; padding:2px 6px; border-radius:6px;}
+  </style>
+</head>
+<body>
+  <h2>🎥 Live Camera</h2>
+  <div class="meta">
+    최신 프레임: <code>/camera/latest.jpg</code> (300ms마다 갱신)
+  </div>
+  <img id="cam" src="/camera/latest.jpg" />
+  <script>
+    const img = document.getElementById("cam");
+    setInterval(() => {
+      img.src = "/camera/latest.jpg?t=" + Date.now(); // 캐시 방지
+    }, 300);
+  </script>
+</body>
+</html>
+"""
+
+
+# ====== ESP32가 JPEG 바이트를 그대로 POST ======
 @app.post("/upload_camera")
 async def upload_camera(request: Request):
-    """
-    ESP32-S3 카메라가 JPEG 바이트를 그대로 POST하는 엔드포인트.
+    global latest_jpg, latest_jpg_ts, latest_jpg_name
 
-    - Content-Type: image/jpeg
-    - Body: JPEG 바이너리
-    """
     body: bytes = await request.body()
-
     if not body:
-        return JSONResponse(
-            {"status": "error", "detail": "empty body"},
-            status_code=400,
-        )
+        return JSONResponse({"status": "error", "detail": "empty body"}, status_code=400)
 
-    # 저장 폴더 생성
-    os.makedirs(CAMERA_DIR, exist_ok=True)
-
-    # 파일 이름: camera_YYYYMMDD_HHMMSS_mmm.jpg
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     filename = f"camera_{ts}.jpg"
     filepath = os.path.join(CAMERA_DIR, filename)
@@ -178,6 +245,11 @@ async def upload_camera(request: Request):
         with open(filepath, "wb") as f:
             f.write(body)
 
+        # 최신 프레임 메모리에도 저장(라이브용)
+        latest_jpg = body
+        latest_jpg_ts = ts
+        latest_jpg_name = filename
+
         print(f"[CAMERA] Saved image: {filepath} ({len(body)} bytes)")
 
         return JSONResponse(
@@ -185,11 +257,12 @@ async def upload_camera(request: Request):
                 "status": "ok",
                 "filename": filename,
                 "size": len(body),
+                "view_url": f"/camera_images/{filename}",
+                "gallery": "/camera",
+                "live": "/camera/live",
+                "latest": "/camera/latest.jpg",
             }
         )
     except Exception as e:
         print("[CAMERA SAVE ERROR]", e)
-        return JSONResponse(
-            {"status": "error", "detail": "save_failed"},
-            status_code=500,
-        )
+        return JSONResponse({"status": "error", "detail": "save_failed"}, status_code=500)
