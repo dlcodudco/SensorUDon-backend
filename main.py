@@ -1,20 +1,16 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+# main.py
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel  # 데이터 형식을 정의하기 위해 추가
-import serial
-import threading
-import time
-import json
-import re
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
 import os
 from datetime import datetime
+from typing import Optional
 
 app = FastAPI()
 
-# -------------------------------
-# CORS 설정
-# -------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,115 +18,164 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------------
-# 전역 변수: 센서 최신 값
-# -------------------------------
-latest_temp: float | None = None   # ℃
-latest_hum: float | None = None    # %RH
-latest_tilt: float | None = None   # deg
+# ====== 최신 센서 값 ======
+latest_temp: Optional[float] = None
+latest_hum: Optional[float] = None
+latest_tilt: Optional[float] = None
 
-# [참고] Render 서버에서는 COM 포트가 없으므로 이 설정은 무시됩니다.
-SERIAL_PORT = "COM5"
-BAUD_RATE = 115200
-
-# 카메라 이미지 저장 폴더
-CAMERA_DIR = "camera_images"
-
-# -------------------------------
-# [추가됨] 데이터 전송 형식 정의
-# -------------------------------
 class SensorData(BaseModel):
-    temperature: float | None = None
-    humidity: float | None = None
-    tilt: float | None = None
+    temperature: Optional[float] = None
+    humidity: Optional[float] = None
+    tilt: Optional[float] = None
 
-# -------------------------------
-# [추가됨] PC(중계기)에서 보낸 센서 값을 받는 우체통
-# -------------------------------
-@app.post("/update_sensor")
-def update_sensor(data: SensorData):
-    global latest_temp, latest_hum, latest_tilt
-    
-    # PC에서 보내준 값이 있으면 전역 변수 업데이트
-    if data.temperature is not None:
-        latest_temp = data.temperature
-    if data.humidity is not None:
-        latest_hum = data.humidity
-    if data.tilt is not None:
-        latest_tilt = data.tilt
-        
-    # print(f"[SERVER] Updated: Temp={latest_temp}, Hum={latest_hum}, Tilt={latest_tilt}")
-    return {"status": "success", "data": data}
+# ====== 카메라 저장 폴더/정적 서빙 ======
+CAMERA_DIR = os.getenv("CAMERA_DIR", "camera_images")
+os.makedirs(CAMERA_DIR, exist_ok=True)
+app.mount("/camera_images", StaticFiles(directory=CAMERA_DIR), name="camera_images")
 
-# -------------------------------
-# 시리얼 리더 스레드 (서버용으로 수정됨)
-# -------------------------------
-def serial_reader():
-    global latest_temp, latest_hum, latest_tilt
-
-    ser = None
-    try:
-        # Render 서버에서는 여기서 무조건 실패합니다 (정상)
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        print(f"[SERIAL] Connected on {SERIAL_PORT}")
-    except Exception as e:
-        print("[SERIAL] 하드웨어 연결 실패 (Render 환경 예상). 외부 데이터 수신 대기 중...")
-        ser = None
-
-    while True:
-        # [중요 수정] 
-        # Render 서버에서는 시리얼 연결이 안 되므로 그냥 대기만 합니다.
-        # 기존의 '더미 데이터 생성' 로직을 삭제했습니다. 
-        # (PC에서 오는 실제 데이터를 덮어쓰지 않기 위함)
-        if ser:
-            try:
-                line = ser.readline().decode(errors="ignore").strip()
-                # (여기는 로컬 테스트용 로직, Render에서는 실행 안 됨)
-                if not line: continue
-                # ... 기존 파싱 로직 ...
-            except:
-                pass
-        
-        # CPU 과부하 방지
-        time.sleep(1)
-
-# 서버 시작 시 스레드 실행
-threading.Thread(target=serial_reader, daemon=True).start()
+# ====== 최신 카메라 프레임(메모리) ======
+latest_jpg: Optional[bytes] = None
+latest_jpg_ts: Optional[str] = None
+latest_jpg_name: Optional[str] = None
 
 
-# -------------------------------
-# API 라우트
-# -------------------------------
 @app.get("/")
 def root():
     return {
-        "status": "SensorUdon Backend Running on Render",
-        "camera_upload": "/upload_camera",
+        "status": "SensorUDon backend running",
         "sensor_endpoint": "/sensor",
-        "update_endpoint": "/update_sensor" # 확인용
+        "update_endpoint": "/update_sensor",
+        "camera_upload": "/upload_camera",
+        "camera_gallery": "/camera",
+        "camera_live": "/camera/live",
+        "camera_latest": "/camera/latest.jpg",
     }
+
 
 @app.get("/sensor")
 def get_sensor():
     return JSONResponse(
-        {
-            "temperature": latest_temp,
-            "humidity": latest_hum,
-            "tilt": latest_tilt,
-        }
+        {"temperature": latest_temp, "humidity": latest_hum, "tilt": latest_tilt}
     )
 
-# -------------------------------
-# 카메라 업로드 엔드포인트
-# -------------------------------
+
+@app.post("/update_sensor")
+def update_sensor(data: SensorData):
+    global latest_temp, latest_hum, latest_tilt
+    if data.temperature is not None:
+        latest_temp = float(data.temperature)
+    if data.humidity is not None:
+        latest_hum = float(data.humidity)
+    if data.tilt is not None:
+        latest_tilt = float(data.tilt)
+    return {"status": "ok", "temperature": latest_temp, "humidity": latest_hum, "tilt": latest_tilt}
+
+
+# ====== 카메라 갤러리(저장된 파일들) ======
+@app.get("/camera", response_class=HTMLResponse)
+def camera_page():
+    files = sorted(
+        [f for f in os.listdir(CAMERA_DIR) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
+        reverse=True
+    )[:50]
+
+    items = "\n".join(
+        [
+            f"""
+            <div style="margin:12px 0;">
+              <div style="font-size:12px;color:#444;margin-bottom:6px;">{f}</div>
+              <img src="/camera_images/{f}" style="max-width:720px;width:100%;border:1px solid #ddd;border-radius:10px;">
+            </div>
+            """
+            for f in files
+        ]
+    ) or "<p>No images yet.</p>"
+
+    return f"""
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>SensorUDon Camera</title>
+      </head>
+      <body style="font-family:Arial, sans-serif; padding:16px; max-width:900px; margin:0 auto;">
+        <h2>📷 Camera uploads</h2>
+        <p>
+          Upload endpoint: <code>/upload_camera</code><br/>
+          Live page: <a href="/camera/live">/camera/live</a><br/>
+          Latest frame: <a href="/camera/latest.jpg">/camera/latest.jpg</a>
+        </p>
+        <hr/>
+        {items}
+      </body>
+    </html>
+    """
+
+
+def _latest_file_path() -> Optional[str]:
+    try:
+        files = sorted(
+            [f for f in os.listdir(CAMERA_DIR) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
+            reverse=True
+        )
+        if not files:
+            return None
+        return os.path.join(CAMERA_DIR, files[0])
+    except Exception:
+        return None
+
+
+@app.get("/camera/latest.jpg")
+def camera_latest():
+    if latest_jpg:
+        return Response(latest_jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    path = _latest_file_path()
+    if not path:
+        raise HTTPException(404, "아직 업로드된 이미지가 없습니다.")
+    with open(path, "rb") as f:
+        data = f.read()
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/camera/live", response_class=HTMLResponse)
+def camera_live():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Camera</title>
+  <style>
+    body{font-family:Arial, sans-serif; padding:16px; max-width:900px; margin:0 auto;}
+    img{max-width:100%; border:1px solid #ddd; border-radius:12px;}
+    .meta{font-size:12px; color:#555; margin:8px 0 12px;}
+    code{background:#f3f3f3; padding:2px 6px; border-radius:6px;}
+  </style>
+</head>
+<body>
+  <h2>🎥 Live Camera</h2>
+  <div class="meta">최신 프레임: <code>/camera/latest.jpg</code> (300ms마다 갱신)</div>
+  <img id="cam" src="/camera/latest.jpg" />
+  <script>
+    const img = document.getElementById("cam");
+    setInterval(() => {
+      img.src = "/camera/latest.jpg?t=" + Date.now();
+    }, 300);
+  </script>
+</body>
+</html>
+"""
+
+
 @app.post("/upload_camera")
 async def upload_camera(request: Request):
+    global latest_jpg, latest_jpg_ts, latest_jpg_name
+
     body: bytes = await request.body()
     if not body:
         return JSONResponse({"status": "error", "detail": "empty body"}, status_code=400)
-
-    # Render 무료 버전은 15분 뒤 파일이 삭제되지만, 데모 시연용으로는 충분합니다.
-    os.makedirs(CAMERA_DIR, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     filename = f"camera_{ts}.jpg"
@@ -139,8 +184,21 @@ async def upload_camera(request: Request):
     try:
         with open(filepath, "wb") as f:
             f.write(body)
-        print(f"[CAMERA] Saved image: {filepath}")
-        return JSONResponse({"status": "ok", "filename": filename})
-    except Exception as e:
-        print("[CAMERA SAVE ERROR]", e)
-        return JSONResponse({"status": "error"}, status_code=500)
+
+        latest_jpg = body
+        latest_jpg_ts = ts
+        latest_jpg_name = filename
+
+        return JSONResponse(
+            {
+                "status": "ok",
+                "filename": filename,
+                "size": len(body),
+                "view_url": f"/camera_images/{filename}",
+                "gallery": "/camera",
+                "live": "/camera/live",
+                "latest": "/camera/latest.jpg",
+            }
+        )
+    except Exception:
+        return JSONResponse({"status": "error", "detail": "save_failed"}, status_code=500)
